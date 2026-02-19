@@ -21,8 +21,8 @@ class App(ctk.CTk):
         self.title("PDF OCR CHECK")
         self.geometry("950x850")
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(7, weight=2)  # Treeview gets more space
-        self.grid_rowconfigure(9, weight=1)  # Log gets some space
+        self.grid_rowconfigure(8, weight=2)  # Treeview gets more space
+        self.grid_rowconfigure(10, weight=1)  # Log gets some space
 
         # --- Configuration Defaults ---
         self.SOURCE_DIR = r"C:\PDFs\All_PDFs"
@@ -318,12 +318,30 @@ class App(ctk.CTk):
         self.progress_bar.set(0)
 
         # ============================================
-        # ROW 6-7: Treeview Results Table
+        # ROW 6: Summary Stats Bar
         # ============================================
-        ctk.CTkLabel(self, text="Scan Results:").grid(row=6, column=0, padx=20, pady=(10, 0), sticky="sw")
+        stats_frame = ctk.CTkFrame(self)
+        stats_frame.grid(row=6, column=0, padx=20, pady=5, sticky="ew")
+
+        self.stats_total = ctk.CTkLabel(stats_frame, text="Total: 0", font=("", 13, "bold"))
+        self.stats_total.grid(row=0, column=0, padx=15, pady=5, sticky="w")
+
+        self.stats_ocr = ctk.CTkLabel(stats_frame, text="OCR-D: 0", text_color="#2ea043")
+        self.stats_ocr.grid(row=0, column=1, padx=15, pady=5, sticky="w")
+
+        self.stats_nonocr = ctk.CTkLabel(stats_frame, text="NON-OCR: 0", text_color="#da3633")
+        self.stats_nonocr.grid(row=0, column=2, padx=15, pady=5, sticky="w")
+
+        self.stats_errors = ctk.CTkLabel(stats_frame, text="Errors: 0", text_color="#d29922")
+        self.stats_errors.grid(row=0, column=3, padx=15, pady=5, sticky="w")
+
+        # ============================================
+        # ROW 7-8: Treeview Results Table
+        # ============================================
+        ctk.CTkLabel(self, text="Scan Results:").grid(row=7, column=0, padx=20, pady=(10, 0), sticky="sw")
 
         tree_frame = ctk.CTkFrame(self)
-        tree_frame.grid(row=7, column=0, padx=20, pady=(5, 5), sticky="nsew")
+        tree_frame.grid(row=8, column=0, padx=20, pady=(5, 5), sticky="nsew")
         tree_frame.grid_columnconfigure(0, weight=1)
         tree_frame.grid_rowconfigure(0, weight=1)
 
@@ -350,11 +368,11 @@ class App(ctk.CTk):
         tree_scroll.grid(row=0, column=1, sticky="ns")
 
         # ============================================
-        # ROW 8-9: Real-time Log
+        # ROW 9-10: Real-time Log
         # ============================================
-        ctk.CTkLabel(self, text="Real-time Log:").grid(row=8, column=0, padx=20, pady=(10, 0), sticky="sw")
+        ctk.CTkLabel(self, text="Real-time Log:").grid(row=9, column=0, padx=20, pady=(10, 0), sticky="sw")
         self.log_textbox = ctk.CTkTextbox(self, wrap="word")
-        self.log_textbox.grid(row=9, column=0, padx=20, pady=(5, 20), sticky="nsew")
+        self.log_textbox.grid(row=10, column=0, padx=20, pady=(5, 20), sticky="nsew")
         self.log_textbox.insert("end", "Ready to start. Click 'START SCAN'.\n")
         self.log_textbox.configure(state="disabled")
 
@@ -467,6 +485,12 @@ class App(ctk.CTk):
         for item in self.tree.get_children():
             self.tree.delete(item)
 
+        # Reset summary stats
+        self.stats_total.configure(text="Total: 0")
+        self.stats_ocr.configure(text="OCR-D: 0")
+        self.stats_nonocr.configure(text="NON-OCR: 0")
+        self.stats_errors.configure(text="Errors: 0")
+
         # --- Read GUI values ---
         try:
             self.MIN_TEXT_CHARS = int(self.threshold_entry.get())
@@ -527,6 +551,8 @@ class App(ctk.CTk):
 
         non_ocr_files = []
         scanned_count = 0
+        ocr_count = 0
+        error_count = 0
         cancelled = False
 
         # --- Build file iterator based on recursive setting ---
@@ -606,7 +632,18 @@ class App(ctk.CTk):
                                 file_log["Error"] = str(e)
                                 self.log(f"    (ERROR moving file: {e})")
                 else:
+                    ocr_count += 1
                     self.log(f"OCR-D: {filename} ({char_display} chars)")
+
+                # Track errors
+                if char_count < 0:
+                    error_count += 1
+
+                # Update summary stats bar
+                self.stats_total.configure(text=f"Total: {scanned_count:,}")
+                self.stats_ocr.configure(text=f"OCR-D: {ocr_count:,}")
+                self.stats_nonocr.configure(text=f"NON-OCR: {len(non_ocr_files):,}")
+                self.stats_errors.configure(text=f"Errors: {error_count:,}")
 
                 # Insert into treeview with alternating row colors
                 try:
