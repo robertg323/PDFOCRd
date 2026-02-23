@@ -1,2 +1,5 @@
 PyMuPDF
 customtkinter
+pytesseract
+pdf2image
+Pillow

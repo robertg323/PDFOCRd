@@ -2,12 +2,19 @@ import os
 import sys
 import json
 import shutil
+import subprocess
 import fitz # PyMuPDF
 import customtkinter as ctk
 from tkinter import filedialog
 import tkinter.ttk as ttk
 import csv
 from datetime import datetime
+import pytesseract
+from pdf2image import convert_from_path
+
+# Configure Tesseract path - must be set before any pytesseract calls
+os.environ['TESSDATA_PREFIX'] = r'C:\Program Files\Tesseract-OCR\tessdata'
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 # =========================
 # APPLICATION CLASS (GUI)
@@ -35,6 +42,8 @@ class App(ctk.CTk):
         # --- New Feature Vars ---
         self.RECURSIVE_SCAN = ctk.BooleanVar(value=True)
         self.DRY_RUN = ctk.BooleanVar(value=False)
+        self.OCR_IN_PLACE = ctk.BooleanVar(value=False)
+        self.tree_item_map = {}   # maps full_path -> treeview iid for Phase 2 row updates
 
         # --- Scan State ---
         self.scan_running = False
@@ -85,6 +94,7 @@ class App(ctk.CTk):
             self.ENABLE_REPORT.set(cfg.get('enable_report', True))
             self.RECURSIVE_SCAN.set(cfg.get('recursive_scan', True))
             self.DRY_RUN.set(cfg.get('dry_run', False))
+            self.OCR_IN_PLACE.set(cfg.get('ocr_in_place', False))
         except (json.JSONDecodeError, IOError, KeyError):
             pass  # Corrupt config -- silently use defaults
 
@@ -103,6 +113,7 @@ class App(ctk.CTk):
             'enable_report': self.ENABLE_REPORT.get(),
             'recursive_scan': self.RECURSIVE_SCAN.get(),
             'dry_run': self.DRY_RUN.get(),
+            'ocr_in_place': self.OCR_IN_PLACE.get(),
         }
         try:
             with open(self.config_path, 'w', encoding='utf-8') as f:
@@ -162,6 +173,28 @@ class App(ctk.CTk):
             self.report_entry.delete(0, "end")
             self.report_entry.insert(0, folder_selected)
             self.log(f"Report Directory set to: {folder_selected}")
+
+    # =========================
+    # MUTUAL EXCLUSIVITY HANDLERS
+    # =========================
+
+    def _on_ocr_in_place_toggle(self):
+        if self.OCR_IN_PLACE.get():
+            self.MOVE_FILES.set(False)
+            self.move_check.configure(state="disabled")
+            self.dest_entry.configure(state="disabled")
+            self.dest_button.configure(state="disabled")
+        else:
+            self.move_check.configure(state="normal")
+            self.dest_entry.configure(state="normal")
+            self.dest_button.configure(state="normal")
+
+    def _on_move_files_toggle(self):
+        if self.MOVE_FILES.get():
+            self.OCR_IN_PLACE.set(False)
+            self.ocr_in_place_check.configure(state="disabled")
+        else:
+            self.ocr_in_place_check.configure(state="normal")
 
     # =========================
     # GUI CONSTRUCTION
@@ -278,9 +311,18 @@ class App(ctk.CTk):
         self.move_check = ctk.CTkCheckBox(
             control_frame,
             text=f"Move files to destination directory ({self.DEST_DIR})",
-            variable=self.MOVE_FILES
+            variable=self.MOVE_FILES,
+            command=self._on_move_files_toggle
         )
         self.move_check.grid(row=0, column=0, padx=10, pady=10, sticky="w")
+
+        self.ocr_in_place_check = ctk.CTkCheckBox(
+            control_frame,
+            text="OCR in place (creates _aocrded.pdf alongside original)",
+            variable=self.OCR_IN_PLACE,
+            command=self._on_ocr_in_place_toggle
+        )
+        self.ocr_in_place_check.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="w")
 
         self.view_report_button = ctk.CTkButton(
             control_frame,
@@ -316,6 +358,11 @@ class App(ctk.CTk):
         self.progress_bar = ctk.CTkProgressBar(progress_frame)
         self.progress_bar.grid(row=1, column=0, padx=10, pady=(0, 5), sticky="ew")
         self.progress_bar.set(0)
+
+        self.ocr_page_status_label = ctk.CTkLabel(
+            progress_frame, text="", text_color="gray", font=("", 11)
+        )
+        self.ocr_page_status_label.grid(row=2, column=0, padx=10, pady=(0, 5), sticky="w")
 
         # ============================================
         # ROW 6: Summary Stats Bar
@@ -375,6 +422,12 @@ class App(ctk.CTk):
         self.log_textbox.grid(row=10, column=0, padx=20, pady=(5, 20), sticky="nsew")
         self.log_textbox.insert("end", "Ready to start. Click 'START SCAN'.\n")
         self.log_textbox.configure(state="disabled")
+
+        # Enforce initial mutual-exclusivity from config
+        if self.OCR_IN_PLACE.get():
+            self._on_ocr_in_place_toggle()
+        elif self.MOVE_FILES.get():
+            self._on_move_files_toggle()
 
     # =========================
     # TREEVIEW SORTING
@@ -458,6 +511,96 @@ class App(ctk.CTk):
         self.run_button.configure(state="normal", text="START SCAN")
         self.cancel_button.configure(state="disabled", text="CANCEL")
 
+        if self.OCR_IN_PLACE.get():
+            self._on_ocr_in_place_toggle()
+        else:
+            self.move_check.configure(state="normal")
+            self.ocr_in_place_check.configure(state="normal")
+
+    # =========================
+    # OCR METHODS
+    # =========================
+
+    def _check_tesseract(self):
+        try:
+            self.log(f"DEBUG: TESSDATA_PREFIX={os.environ.get('TESSDATA_PREFIX')}")
+            self.log(f"DEBUG: tesseract_cmd={pytesseract.pytesseract.tesseract_cmd}")
+
+            # Simply check if the executable exists (avoid subprocess issues in compiled exe)
+            tesseract_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+            if os.path.exists(tesseract_path):
+                self.log(f"Tesseract found at: {tesseract_path}")
+                return True
+            else:
+                self.log("ERROR: Tesseract OCR engine not found at expected path.")
+                self.log("  Install from: https://github.com/UB-Mannheim/tesseract/wiki")
+                self.log("  Then restart this application.")
+                return False
+
+        except Exception as e:
+            self.log(f"ERROR: Could not verify Tesseract: {e}")
+            self.log(f"  Tesseract path: {pytesseract.pytesseract.tesseract_cmd}")
+            self.log("  https://github.com/UB-Mannheim/tesseract/wiki")
+            return False
+
+    def ocr_pdf(self, pdf_path, output_path, status_callback=None):
+        """
+        OCR a PDF using Tesseract.
+        Returns tuple: (success: bool, error_message: str)
+        Calls status_callback(page_num, total_pages) before each page if provided.
+        """
+        try:
+            # Convert PDF pages to images
+            images = convert_from_path(pdf_path, dpi=300)
+            total_pages = len(images)
+
+            # OCR each page and collect PDF bytes
+            pdf_bytes_list = []
+            for page_num, image in enumerate(images, start=1):
+                # Call status callback
+                if status_callback:
+                    try:
+                        status_callback(page_num, total_pages)
+                    except Exception:
+                        pass  # Window may have been destroyed
+
+                # OCR image to PDF bytes
+                pdf_bytes = pytesseract.image_to_pdf_or_hocr(image, extension='pdf')
+                pdf_bytes_list.append(pdf_bytes)
+
+            # Merge all page PDFs using fitz
+            merged_doc = fitz.open(stream=pdf_bytes_list[0], filetype="pdf")
+            for page_bytes in pdf_bytes_list[1:]:
+                temp_doc = fitz.open(stream=page_bytes, filetype="pdf")
+                merged_doc.insert_pdf(temp_doc)
+                temp_doc.close()
+
+            # Save merged PDF
+            merged_doc.save(output_path)
+            merged_doc.close()
+
+            return (True, "")
+        except Exception as e:
+            return (False, str(e))
+
+    def _get_ocr_output_path(self, original_path):
+        r"""
+        Given a path like C:\dir\MyFile.pdf, return C:\dir\MyFile_aocrded.pdf
+        If that exists, increment counter: _aocrded_1.pdf, _aocrded_2.pdf, etc.
+        """
+        base, ext = os.path.splitext(original_path)
+        output_path = f"{base}_aocrded{ext}"
+
+        if not os.path.exists(output_path):
+            return output_path
+
+        counter = 1
+        while True:
+            output_path = f"{base}_aocrded_{counter}{ext}"
+            if not os.path.exists(output_path):
+                return output_path
+            counter += 1
+
     # =========================
     # MAIN SCAN LOGIC
     # =========================
@@ -505,6 +648,17 @@ class App(ctk.CTk):
         enable_report = self.ENABLE_REPORT.get()
         recursive = self.RECURSIVE_SCAN.get()
         dry_run = self.DRY_RUN.get()
+        ocr_in_place = self.OCR_IN_PLACE.get()
+
+        # Validate mutual exclusivity and check Tesseract
+        if move_files and ocr_in_place:
+            self.log("ERROR: Both 'Move files' and 'OCR in place' enabled. Select only one.")
+            self._scan_cleanup()
+            return
+        if ocr_in_place:
+            if not self._check_tesseract():
+                self._scan_cleanup()
+                return
 
         # --- Count PDF files first for progress bar ---
         self.log("Counting PDF files...")
@@ -527,10 +681,16 @@ class App(ctk.CTk):
         self.log(f"Found {total_files} PDF file(s) to scan.")
         self.progress_bar.set(0)
         self.progress_label.configure(text=f"0 of {total_files} files scanned")
+        self.ocr_page_status_label.configure(text="")
 
         # --- Log scan settings ---
         if dry_run:
-            self.log("*** DRY RUN MODE -- No files will be moved ***")
+            self.log("*** DRY RUN MODE -- No files will be moved or OCR'd ***")
+        if ocr_in_place:
+            if dry_run:
+                self.log("*** OCR IN PLACE MODE (DRY RUN) -- Would OCR non-OCR files (no actual changes) ***")
+            else:
+                self.log("*** OCR IN PLACE MODE -- Non-OCR files will be OCR'd in their source directory ***")
         self.log(f"Starting scan of: {source_dir}")
         self.log(f"Recursive: {'Yes' if recursive else 'No'}")
         self.log(f"Move files: {move_files}")
@@ -539,7 +699,11 @@ class App(ctk.CTk):
 
         # --- Prepare CSV ---
         log_data = []
-        csv_header = ["Timestamp", "Filename", "Full Path", "OCR Status", "Char Count", "Action", "Final Destination", "Error"]
+        csv_header = [
+            "Timestamp", "Filename", "Full Path", "OCR Status", "Char Count",
+            "Action", "Final Destination", "Error",
+            "OCR Phase Status", "OCR Output File", "OCR Verify Status"
+        ]
 
         if move_files and not dry_run:
             os.makedirs(dest_dir, exist_ok=True)
@@ -554,6 +718,10 @@ class App(ctk.CTk):
         ocr_count = 0
         error_count = 0
         cancelled = False
+        log_data_map = {}       # full_path -> file_log dict reference
+        self.tree_item_map = {} # reset for this scan
+        ocr_success_count = 0
+        ocr_fail_count = 0
 
         # --- Build file iterator based on recursive setting ---
         if recursive:
@@ -592,7 +760,8 @@ class App(ctk.CTk):
                     "Timestamp": datetime.now().strftime("%H:%M:%S"),
                     "Filename": filename,
                     "Full Path": full_path,
-                    "Error": ""
+                    "Error": "",
+                    "OCR Phase Status": "", "OCR Output File": "", "OCR Verify Status": ""
                 }
 
                 # OCR check (returns tuple)
@@ -648,7 +817,8 @@ class App(ctk.CTk):
                 # Insert into treeview with alternating row colors
                 try:
                     row_tag = "even" if scanned_count % 2 == 0 else "odd"
-                    self.tree.insert("", "end", values=(filename, ocr_status, char_display, action), tags=(row_tag,))
+                    iid = self.tree.insert("", "end", values=(filename, ocr_status, char_display, action), tags=(row_tag,))
+                    self.tree_item_map[full_path] = iid
                 except Exception:
                     pass  # Window may have been destroyed
 
@@ -658,6 +828,7 @@ class App(ctk.CTk):
                 file_log["Action"] = action
                 file_log["Final Destination"] = final_dest
                 log_data.append(file_log)
+                log_data_map[full_path] = file_log
 
                 # Update progress
                 if total_files > 0:
@@ -669,6 +840,97 @@ class App(ctk.CTk):
             self.log(f"\nFATAL ERROR: Source directory not found: {source_dir}")
         except Exception as e:
             self.log(f"\nAN UNEXPECTED ERROR OCCURRED: {e}")
+
+        # --- Phase 2: OCR In Place ---
+        if ocr_in_place and not cancelled and not dry_run and len(non_ocr_files) > 0:
+            self.log("\n=========================")
+            self.log("PHASE 2: OCR IN PLACE")
+            self.log("=========================")
+            self.progress_bar.set(0)
+            self.run_button.configure(text="OCR Phase...")
+
+            for ocr_index, orig_path in enumerate(non_ocr_files):
+                # Cancel check
+                if self.cancel_requested:
+                    cancelled = True
+                    self.log("\n*** OCR PHASE CANCELLED BY USER ***")
+                    break
+
+                filename = os.path.basename(orig_path)
+                dirname = os.path.dirname(orig_path)
+
+                # Update treeview
+                if orig_path in self.tree_item_map:
+                    iid = self.tree_item_map[orig_path]
+                    self.tree.item(iid, values=(filename, "OCRing...", "", "Pending OCR"))
+
+                # Update status label
+                self.ocr_page_status_label.configure(text=f"OCRing: {dirname} | {filename} | Starting...")
+                self.update()
+
+                # Get output path
+                output_path = self._get_ocr_output_path(orig_path)
+
+                # Define page callback with default args to avoid late-binding
+                def _page_callback(page_num, total_pages, dir_name=dirname, file_name=filename):
+                    self.ocr_page_status_label.configure(text=f"OCRing: {dir_name} | {file_name} | Page {page_num} of {total_pages}")
+                    self.update()
+
+                # Run OCR
+                ocr_ok, ocr_error = self.ocr_pdf(orig_path, output_path, _page_callback)
+
+                ocr_phase_status = ""
+                ocr_output_file = ""
+                ocr_verify_status = ""
+                action_result = "Pending OCR"
+
+                if ocr_ok:
+                    # Verify the output
+                    verify_ok, verify_chars = self.is_pdf_ocred(output_path)
+                    if verify_ok:
+                        ocr_success_count += 1
+                        ocr_phase_status = "OCR Success"
+                        action_result = "OCR'd in place"
+                        ocr_output_file = output_path
+                        ocr_verify_status = f"Verified - {verify_chars:,} chars"
+                    else:
+                        ocr_fail_count += 1
+                        ocr_phase_status = "OCR Failed"
+                        action_result = "OCR Failed"
+                        ocr_verify_status = f"Verification failed - {verify_chars:,} chars"
+                        try:
+                            os.remove(output_path)
+                        except Exception:
+                            pass
+                        output_path = ""
+                else:
+                    ocr_fail_count += 1
+                    ocr_phase_status = "OCR Failed"
+                    action_result = "OCR Failed"
+                    ocr_verify_status = f"Error: {ocr_error}"
+                    output_path = ""
+
+                # Update treeview row
+                if orig_path in self.tree_item_map:
+                    iid = self.tree_item_map[orig_path]
+                    self.tree.item(iid, values=(filename, ocr_phase_status, "", action_result))
+
+                # Update log data map
+                if orig_path in log_data_map:
+                    log_data_map[orig_path]["OCR Phase Status"] = ocr_phase_status
+                    log_data_map[orig_path]["OCR Output File"] = ocr_output_file
+                    log_data_map[orig_path]["OCR Verify Status"] = ocr_verify_status
+
+                # Update progress
+                if len(non_ocr_files) > 0:
+                    self.progress_bar.set((ocr_index + 1) / len(non_ocr_files))
+                self.progress_label.configure(text=f"{ocr_index + 1} of {len(non_ocr_files)} files OCR'd | Failed: {ocr_fail_count}")
+                self.update()
+
+            self.ocr_page_status_label.configure(text="")
+
+        elif ocr_in_place and len(non_ocr_files) == 0:
+            self.log("No non-OCR files found. Nothing to OCR.")
 
         # --- Save CSV Log (Conditional) ---
         if enable_report:
@@ -696,9 +958,14 @@ class App(ctk.CTk):
         self.log(f"Total files scanned: {scanned_count}" + (" (cancelled)" if cancelled else ""))
         self.log(f"Total non-OCR PDFs found: {len(non_ocr_files)}")
         if dry_run:
-            self.log("*** This was a DRY RUN -- no files were moved ***")
+            self.log("*** This was a DRY RUN -- no files were moved or OCR'd ***")
         elif move_files:
             self.log(f"Files moved to: {dest_dir}")
+        if ocr_in_place:
+            if dry_run:
+                self.log(f"OCR In Place (DRY RUN): Would have OCR'd {len(non_ocr_files)} files")
+            else:
+                self.log(f"OCR In Place: {ocr_success_count} succeeded, {ocr_fail_count} failed.")
         self.log("Scan complete.")
 
         self._scan_cleanup()
