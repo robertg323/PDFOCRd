@@ -5,12 +5,17 @@ import shutil
 import subprocess
 import fitz # PyMuPDF
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import filedialog
 import tkinter.ttk as ttk
 import csv
 from datetime import datetime
 import pytesseract
 from pdf2image import convert_from_path
+from PIL import Image, ImageTk
+
+_PREVIEW_W = 360        # width of the preview panel (pixels)
+_PREVIEW_RENDER_W = 320 # target render width for PDF pages
 
 # Configure Tesseract path - must be set before any pytesseract calls
 os.environ['TESSDATA_PREFIX'] = r'C:\Program Files\Tesseract-OCR\tessdata'
@@ -25,25 +30,30 @@ class App(ctk.CTk):
         super().__init__()
 
         # --- Configure Window ---
-        self.title("PDF OCR CHECK")
+        self.title("PDF OCR CHECK v1.0")
         self.geometry("950x850")
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(8, weight=2)  # Treeview gets more space
-        self.grid_rowconfigure(10, weight=1)  # Log gets some space
+        self.grid_rowconfigure(0, weight=1)
 
         # --- Configuration Defaults ---
         self.SOURCE_DIR = r"C:\PDFs\All_PDFs"
         self.DEST_DIR = r"C:\PDFs\Non_OCR_PDFs"
         self.REPORT_DIR = r"C:\PDFs\Reports"
-        self.MOVE_FILES = ctk.BooleanVar(value=True)
+        self.FILE_ACTION = ctk.StringVar(value="move")  # "move", "ocr", or "none"
         self.ENABLE_REPORT = ctk.BooleanVar(value=True)
         self.MIN_TEXT_CHARS = 50
 
         # --- New Feature Vars ---
         self.RECURSIVE_SCAN = ctk.BooleanVar(value=True)
         self.DRY_RUN = ctk.BooleanVar(value=False)
-        self.OCR_IN_PLACE = ctk.BooleanVar(value=False)
-        self.tree_item_map = {}   # maps full_path -> treeview iid for Phase 2 row updates
+        self.tree_item_map = {}    # maps full_path -> treeview iid for Phase 2 row updates
+        self.tree_iid_to_path = {} # reverse map: iid -> full_path for interactions
+
+        # --- Preview State ---
+        self.preview_pdf_path = None
+        self.preview_page = 0
+        self.preview_total_pages = 0
+        self._preview_visible = False
 
         # --- Scan State ---
         self.scan_running = False
@@ -90,11 +100,18 @@ class App(ctk.CTk):
             self.DEST_DIR = cfg.get('dest_dir', self.DEST_DIR)
             self.REPORT_DIR = cfg.get('report_dir', self.REPORT_DIR)
             self.MIN_TEXT_CHARS = cfg.get('threshold', self.MIN_TEXT_CHARS)
-            self.MOVE_FILES.set(cfg.get('move_files', True))
+            # Load file_action; fall back to reading legacy move_files/ocr_in_place booleans
+            if 'file_action' in cfg:
+                self.FILE_ACTION.set(cfg['file_action'])
+            elif cfg.get('ocr_in_place', False):
+                self.FILE_ACTION.set('ocr')
+            elif cfg.get('move_files', True):
+                self.FILE_ACTION.set('move')
+            else:
+                self.FILE_ACTION.set('none')
             self.ENABLE_REPORT.set(cfg.get('enable_report', True))
             self.RECURSIVE_SCAN.set(cfg.get('recursive_scan', True))
             self.DRY_RUN.set(cfg.get('dry_run', False))
-            self.OCR_IN_PLACE.set(cfg.get('ocr_in_place', False))
         except (json.JSONDecodeError, IOError, KeyError):
             pass  # Corrupt config -- silently use defaults
 
@@ -109,11 +126,10 @@ class App(ctk.CTk):
             'dest_dir': self.dest_entry.get(),
             'report_dir': self.report_entry.get(),
             'threshold': threshold,
-            'move_files': self.MOVE_FILES.get(),
+            'file_action': self.FILE_ACTION.get(),
             'enable_report': self.ENABLE_REPORT.get(),
             'recursive_scan': self.RECURSIVE_SCAN.get(),
             'dry_run': self.DRY_RUN.get(),
-            'ocr_in_place': self.OCR_IN_PLACE.get(),
         }
         try:
             with open(self.config_path, 'w', encoding='utf-8') as f:
@@ -175,32 +191,33 @@ class App(ctk.CTk):
             self.log(f"Report Directory set to: {folder_selected}")
 
     # =========================
-    # MUTUAL EXCLUSIVITY HANDLERS
+    # FILE ACTION HANDLER
     # =========================
 
-    def _on_ocr_in_place_toggle(self):
-        if self.OCR_IN_PLACE.get():
-            self.MOVE_FILES.set(False)
-            self.move_check.configure(state="disabled")
-            self.dest_entry.configure(state="disabled")
-            self.dest_button.configure(state="disabled")
-        else:
-            self.move_check.configure(state="normal")
+    def _on_file_action_change(self):
+        """Enable dest entry/button only when 'Move files' is selected."""
+        if self.FILE_ACTION.get() == "move":
             self.dest_entry.configure(state="normal")
             self.dest_button.configure(state="normal")
-
-    def _on_move_files_toggle(self):
-        if self.MOVE_FILES.get():
-            self.OCR_IN_PLACE.set(False)
-            self.ocr_in_place_check.configure(state="disabled")
         else:
-            self.ocr_in_place_check.configure(state="normal")
+            self.dest_entry.configure(state="disabled")
+            self.dest_button.configure(state="disabled")
 
     # =========================
     # GUI CONSTRUCTION
     # =========================
 
     def create_widgets(self):
+
+        # --- Main PanedWindow (fills entire window, holds left controls + right preview) ---
+        self.paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        self.paned.grid(row=0, column=0, sticky="nsew")
+
+        left_frame = ctk.CTkFrame(self.paned, fg_color="transparent", corner_radius=0)
+        self.paned.add(left_frame, weight=1)
+        left_frame.grid_columnconfigure(0, weight=1)
+        left_frame.grid_rowconfigure(8, weight=2)   # Treeview gets more space
+        left_frame.grid_rowconfigure(11, weight=1)  # Log gets some space
 
         # --- Treeview light theme styling (must be set before creating Treeview) ---
         style = ttk.Style()
@@ -224,7 +241,7 @@ class App(ctk.CTk):
         # ============================================
         # ROW 0: Header Frame (Source/Destination)
         # ============================================
-        header_frame = ctk.CTkFrame(self)
+        header_frame = ctk.CTkFrame(left_frame)
         header_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
         header_frame.grid_columnconfigure(1, weight=1)
 
@@ -247,7 +264,7 @@ class App(ctk.CTk):
         # ============================================
         # ROW 1: Threshold Input Frame
         # ============================================
-        threshold_frame = ctk.CTkFrame(self)
+        threshold_frame = ctk.CTkFrame(left_frame)
         threshold_frame.grid(row=1, column=0, padx=20, pady=5, sticky="ew")
         threshold_frame.grid_columnconfigure(0, weight=1)
 
@@ -262,7 +279,7 @@ class App(ctk.CTk):
         # ============================================
         # ROW 2: Report Control Frame
         # ============================================
-        report_frame = ctk.CTkFrame(self)
+        report_frame = ctk.CTkFrame(left_frame)
         report_frame.grid(row=2, column=0, padx=20, pady=5, sticky="ew")
         report_frame.grid_columnconfigure(1, weight=1)
 
@@ -272,6 +289,14 @@ class App(ctk.CTk):
             variable=self.ENABLE_REPORT
         )
         self.report_check.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+
+        self.view_report_button = ctk.CTkButton(
+            report_frame,
+            text="View Report",
+            command=self.view_report,
+            state="disabled"
+        )
+        self.view_report_button.grid(row=0, column=2, padx=(0, 10), pady=5, sticky="e")
 
         ctk.CTkLabel(report_frame, text="Report Directory:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
         self.report_entry = ctk.CTkEntry(report_frame, width=450)
@@ -284,7 +309,7 @@ class App(ctk.CTk):
         # ============================================
         # ROW 3: Options Frame (Recursive + Dry Run)
         # ============================================
-        options_frame = ctk.CTkFrame(self)
+        options_frame = ctk.CTkFrame(left_frame)
         options_frame.grid(row=3, column=0, padx=20, pady=5, sticky="ew")
 
         self.recursive_check = ctk.CTkCheckBox(
@@ -304,36 +329,41 @@ class App(ctk.CTk):
         # ============================================
         # ROW 4: Control Frame (Move, View Report, Start, Cancel)
         # ============================================
-        control_frame = ctk.CTkFrame(self)
+        control_frame = ctk.CTkFrame(left_frame)
         control_frame.grid(row=4, column=0, padx=20, pady=10, sticky="ew")
         control_frame.grid_columnconfigure(0, weight=1)
 
-        self.move_check = ctk.CTkCheckBox(
-            control_frame,
-            text=f"Move files to destination directory ({self.DEST_DIR})",
-            variable=self.MOVE_FILES,
-            command=self._on_move_files_toggle
-        )
-        self.move_check.grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        radio_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
+        radio_frame.grid(row=0, column=0, rowspan=2, padx=10, pady=5, sticky="w")
 
-        self.ocr_in_place_check = ctk.CTkCheckBox(
-            control_frame,
+        ctk.CTkLabel(radio_frame, text="Non-OCR file action:").grid(row=0, column=0, padx=(0, 10), pady=(5, 2), sticky="w")
+
+        ctk.CTkRadioButton(
+            radio_frame,
+            text="Move files to destination directory",
+            variable=self.FILE_ACTION,
+            value="move",
+            command=self._on_file_action_change
+        ).grid(row=1, column=0, padx=10, pady=2, sticky="w")
+
+        ctk.CTkRadioButton(
+            radio_frame,
             text="OCR in place (creates _aocrded.pdf alongside original)",
-            variable=self.OCR_IN_PLACE,
-            command=self._on_ocr_in_place_toggle
-        )
-        self.ocr_in_place_check.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="w")
+            variable=self.FILE_ACTION,
+            value="ocr",
+            command=self._on_file_action_change
+        ).grid(row=2, column=0, padx=10, pady=2, sticky="w")
 
-        self.view_report_button = ctk.CTkButton(
-            control_frame,
-            text="View Report",
-            command=self.view_report,
-            state="disabled"
-        )
-        self.view_report_button.grid(row=0, column=1, padx=10, pady=10, sticky="e")
+        ctk.CTkRadioButton(
+            radio_frame,
+            text="No action (report only)",
+            variable=self.FILE_ACTION,
+            value="none",
+            command=self._on_file_action_change
+        ).grid(row=3, column=0, padx=10, pady=(2, 5), sticky="w")
 
         self.run_button = ctk.CTkButton(control_frame, text="START SCAN", command=self.start_scan)
-        self.run_button.grid(row=0, column=2, padx=(5, 5), pady=10, sticky="e")
+        self.run_button.grid(row=0, column=1, padx=(5, 5), pady=10, sticky="e")
 
         self.cancel_button = ctk.CTkButton(
             control_frame,
@@ -343,12 +373,12 @@ class App(ctk.CTk):
             fg_color="red",
             hover_color="darkred"
         )
-        self.cancel_button.grid(row=0, column=3, padx=(5, 10), pady=10, sticky="e")
+        self.cancel_button.grid(row=0, column=2, padx=(5, 10), pady=10, sticky="e")
 
         # ============================================
         # ROW 5: Progress Frame
         # ============================================
-        progress_frame = ctk.CTkFrame(self)
+        progress_frame = ctk.CTkFrame(left_frame)
         progress_frame.grid(row=5, column=0, padx=20, pady=5, sticky="ew")
         progress_frame.grid_columnconfigure(0, weight=1)
 
@@ -367,7 +397,7 @@ class App(ctk.CTk):
         # ============================================
         # ROW 6: Summary Stats Bar
         # ============================================
-        stats_frame = ctk.CTkFrame(self)
+        stats_frame = ctk.CTkFrame(left_frame)
         stats_frame.grid(row=6, column=0, padx=20, pady=5, sticky="ew")
 
         self.stats_total = ctk.CTkLabel(stats_frame, text="Total: 0", font=("", 13, "bold"))
@@ -385,9 +415,9 @@ class App(ctk.CTk):
         # ============================================
         # ROW 7-8: Treeview Results Table
         # ============================================
-        ctk.CTkLabel(self, text="Scan Results:").grid(row=7, column=0, padx=20, pady=(10, 0), sticky="sw")
+        ctk.CTkLabel(left_frame, text="Scan Results:").grid(row=7, column=0, padx=20, pady=(10, 0), sticky="sw")
 
-        tree_frame = ctk.CTkFrame(self)
+        tree_frame = ctk.CTkFrame(left_frame)
         tree_frame.grid(row=8, column=0, padx=20, pady=(5, 5), sticky="nsew")
         tree_frame.grid_columnconfigure(0, weight=1)
         tree_frame.grid_rowconfigure(0, weight=1)
@@ -414,20 +444,71 @@ class App(ctk.CTk):
         self.tree.grid(row=0, column=0, sticky="nsew")
         tree_scroll.grid(row=0, column=1, sticky="ns")
 
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+        self.tree.bind("<Motion>", self._tree_tooltip_show)
+        self.tree.bind("<Leave>", self._tree_tooltip_hide)
+        self.tree.bind("<<TreeviewSelect>>", self._update_preview)
+
         # ============================================
-        # ROW 9-10: Real-time Log
+        # ROW 9: Show/Hide Preview button (right-aligned, under treeview)
         # ============================================
-        ctk.CTkLabel(self, text="Real-time Log:").grid(row=9, column=0, padx=20, pady=(10, 0), sticky="sw")
-        self.log_textbox = ctk.CTkTextbox(self, wrap="word")
-        self.log_textbox.grid(row=10, column=0, padx=20, pady=(5, 20), sticky="nsew")
+        preview_btn_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        preview_btn_frame.grid(row=9, column=0, padx=20, pady=(2, 0), sticky="ew")
+        preview_btn_frame.grid_columnconfigure(0, weight=1)
+
+        self.preview_toggle_btn = ctk.CTkButton(
+            preview_btn_frame,
+            text="Show Preview",
+            command=self._toggle_preview,
+            width=120
+        )
+        self.preview_toggle_btn.grid(row=0, column=1, pady=2, sticky="e")
+
+        # ============================================
+        # ROW 10-11: Real-time Log
+        # ============================================
+        ctk.CTkLabel(left_frame, text="Real-time Log:").grid(row=10, column=0, padx=20, pady=(10, 0), sticky="sw")
+        self.log_textbox = ctk.CTkTextbox(left_frame, wrap="word")
+        self.log_textbox.grid(row=11, column=0, padx=20, pady=(5, 20), sticky="nsew")
         self.log_textbox.insert("end", "Ready to start. Click 'START SCAN'.\n")
         self.log_textbox.configure(state="disabled")
 
-        # Enforce initial mutual-exclusivity from config
-        if self.OCR_IN_PLACE.get():
-            self._on_ocr_in_place_toggle()
-        elif self.MOVE_FILES.get():
-            self._on_move_files_toggle()
+        # Apply initial dest entry state based on loaded config
+        self._on_file_action_change()
+
+        # ============================================
+        # Preview Panel (right pane — added to PanedWindow on demand)
+        # ============================================
+        self.preview_frame = ctk.CTkFrame(self.paned, corner_radius=0)
+        self.preview_frame.grid_rowconfigure(1, weight=1)
+        self.preview_frame.grid_columnconfigure(0, weight=1)
+
+        self.preview_title_label = ctk.CTkLabel(
+            self.preview_frame, text="No file selected",
+            font=("", 11, "bold"), wraplength=_PREVIEW_W - 20
+        )
+        self.preview_title_label.grid(row=0, column=0, columnspan=2, padx=10, pady=(10, 4), sticky="ew")
+
+        canvas_outer = ctk.CTkFrame(self.preview_frame, fg_color="white")
+        canvas_outer.grid(row=1, column=0, columnspan=2, padx=(10, 0), pady=4, sticky="nsew")
+        canvas_outer.grid_rowconfigure(0, weight=1)
+        canvas_outer.grid_columnconfigure(0, weight=1)
+
+        self.preview_canvas = tk.Canvas(canvas_outer, bg="white", highlightthickness=0)
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+
+        # Scrollbar repurposed as document-position indicator
+        self.preview_vscroll = ttk.Scrollbar(
+            self.preview_frame, orient="vertical",
+            command=self._preview_scrollbar_command
+        )
+        self.preview_vscroll.grid(row=1, column=1, padx=(0, 10), pady=4, sticky="ns")
+
+        self.preview_canvas.bind("<MouseWheel>", self._preview_mousewheel)
+        self.preview_canvas.bind("<Configure>", self._on_preview_canvas_resize)
+
+        self.preview_page_label = ctk.CTkLabel(self.preview_frame, text="")
+        self.preview_page_label.grid(row=2, column=0, columnspan=2, padx=10, pady=(4, 10))
 
     # =========================
     # TREEVIEW SORTING
@@ -454,6 +535,199 @@ class App(ctk.CTk):
 
         # Toggle sort direction for next click
         self.tree.heading(col, command=lambda: self._sort_tree(col, not reverse))
+
+    # =========================
+    # TREEVIEW INTERACTIONS
+    # =========================
+
+    def _on_tree_double_click(self, event):
+        """Open the PDF under the cursor with the default system program."""
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        path = self.tree_iid_to_path.get(iid, "")
+        if not path:
+            return
+        if os.path.exists(path):
+            try:
+                os.startfile(path)
+            except Exception as e:
+                self.log(f"ERROR: Could not open file: {e}")
+        else:
+            self.log(f"ERROR: File not found (may have been moved): {os.path.basename(path)}")
+
+    def _tree_tooltip_show(self, event):
+        """Show a tooltip with the full file path for the row under the cursor, only if selected."""
+        iid = self.tree.identify_row(event.y)
+        if not iid or iid not in self.tree.selection():
+            self._tree_tooltip_hide()
+            return
+        path = self.tree_iid_to_path.get(iid, "")
+        if not path:
+            self._tree_tooltip_hide()
+            return
+        if not hasattr(self, '_tooltip') or self._tooltip is None:
+            self._tooltip = tk.Toplevel(self)
+            self._tooltip.wm_overrideredirect(True)
+            self._tooltip.wm_attributes("-topmost", True)
+            self._tooltip_label = tk.Label(
+                self._tooltip, text=os.path.basename(path),
+                bg="#ffffe0", fg="black",
+                relief="solid", borderwidth=1,
+                font=("", 9), padx=4, pady=2
+            )
+            self._tooltip_label.pack()
+        else:
+            self._tooltip_label.configure(text=os.path.basename(path))
+            self._tooltip.deiconify()
+        self._tooltip.wm_geometry(f"+{event.x_root + 14}+{event.y_root + 14}")
+
+    def _tree_tooltip_hide(self, event=None):
+        """Hide the tooltip window."""
+        if hasattr(self, '_tooltip') and self._tooltip is not None:
+            self._tooltip.withdraw()
+
+    # =========================
+    # PDF PREVIEW
+    # =========================
+
+    def _toggle_preview(self):
+        """Show or hide the preview panel via PanedWindow add/forget."""
+        if self._preview_visible:
+            self.paned.forget(self.preview_frame)
+            self._preview_visible = False
+            self.preview_toggle_btn.configure(text="Show Preview")
+        else:
+            self.paned.add(self.preview_frame, weight=0)
+            self._preview_visible = True
+            self.preview_toggle_btn.configure(text="Hide Preview")
+            # Delay render until the canvas has been sized by the layout manager
+            self.after(50, self._update_preview)
+
+    def _update_preview(self, event=None):
+        """Refresh preview when treeview selection changes."""
+        if not self.preview_frame.winfo_ismapped():
+            return
+        selection = self.tree.selection()
+        if not selection:
+            self._preview_show_placeholder("Select a row to preview")
+            return
+        path = self.tree_iid_to_path.get(selection[0], "")
+        if not path:
+            self._preview_show_placeholder("No path available")
+            return
+        if not os.path.exists(path):
+            self._preview_show_placeholder("File not found\n(may have been moved)")
+            return
+        if path != self.preview_pdf_path:
+            self.preview_pdf_path = path
+            self.preview_page = 0
+        self._render_preview_page()
+
+    def _render_preview_page(self):
+        """Render the current page scaled to fit the canvas (full-page view)."""
+        try:
+            self.preview_canvas.update_idletasks()
+            cw = self.preview_canvas.winfo_width()
+            ch = self.preview_canvas.winfo_height()
+            if cw < 10:
+                cw = _PREVIEW_RENDER_W
+            if ch < 10:
+                ch = 600
+
+            doc = fitz.open(self.preview_pdf_path)
+            self.preview_total_pages = len(doc)
+            if self.preview_page >= self.preview_total_pages:
+                self.preview_page = 0
+            page = doc.load_page(self.preview_page)
+
+            # Scale to fit canvas (maintain aspect ratio, show full page)
+            scale = min(cw / page.rect.width, ch / page.rect.height)
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+            doc.close()
+
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            photo = ImageTk.PhotoImage(img)
+
+            # Centre the page on the canvas
+            x = (cw - pix.width) // 2
+            y = (ch - pix.height) // 2
+
+            self.preview_canvas.configure(scrollregion=(0, 0, cw, ch))
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_rectangle(0, 0, cw, ch, fill="#404040", outline="")
+            self.preview_canvas.create_image(x, y, anchor="nw", image=photo)
+            self.preview_canvas._photo_ref = photo  # prevent GC
+
+            self.preview_title_label.configure(text=os.path.basename(self.preview_pdf_path))
+            self.preview_page_label.configure(text=f"Page {self.preview_page + 1} of {self.preview_total_pages}")
+
+            # Update scrollbar thumb to reflect position within document
+            if self.preview_total_pages <= 1:
+                self.preview_vscroll.set(0.0, 1.0)
+            else:
+                start = self.preview_page / self.preview_total_pages
+                end = (self.preview_page + 1) / self.preview_total_pages
+                self.preview_vscroll.set(start, end)
+        except Exception as e:
+            self._preview_show_placeholder(f"Preview error:\n{e}")
+
+    def _preview_show_placeholder(self, message="Select a row to preview"):
+        """Show a centred message on the preview canvas."""
+        self.preview_canvas.delete("all")
+        cw = self.preview_canvas.winfo_width() or _PREVIEW_RENDER_W
+        ch = self.preview_canvas.winfo_height() or 400
+        self.preview_canvas.create_text(
+            cw // 2, ch // 2,
+            text=message, fill="gray", font=("", 11), justify="center"
+        )
+        self.preview_title_label.configure(text="No file selected")
+        self.preview_page_label.configure(text="")
+        self.preview_vscroll.set(0.0, 1.0)
+        self.preview_pdf_path = None
+        self.preview_total_pages = 0
+
+    def _preview_scrollbar_command(self, *args):
+        """Scrollbar drives page navigation, not pixel scrolling."""
+        if not self.preview_total_pages:
+            return
+        cmd = args[0]
+        if cmd == "moveto":
+            fraction = float(args[1])
+            page = int(fraction * self.preview_total_pages)
+            page = max(0, min(page, self.preview_total_pages - 1))
+        elif cmd == "scroll":
+            delta = int(args[1])
+            page = max(0, min(self.preview_page + delta, self.preview_total_pages - 1))
+        else:
+            return
+        if page != self.preview_page:
+            self.preview_page = page
+            self._render_preview_page()
+
+    def _preview_mousewheel(self, event):
+        """Scroll wheel navigates pages."""
+        if not self.preview_pdf_path:
+            return
+        if event.delta < 0:
+            self._preview_page_next()
+        else:
+            self._preview_page_prev()
+
+    def _on_preview_canvas_resize(self, event):
+        """Re-render when the preview panel is resized."""
+        if self.preview_pdf_path and self._preview_visible:
+            self._render_preview_page()
+
+    def _preview_page_prev(self):
+        if self.preview_page > 0:
+            self.preview_page -= 1
+            self._render_preview_page()
+
+    def _preview_page_next(self):
+        if self.preview_page < self.preview_total_pages - 1:
+            self.preview_page += 1
+            self._render_preview_page()
 
     # =========================
     # LOGGING UTILITY
@@ -511,11 +785,7 @@ class App(ctk.CTk):
         self.run_button.configure(state="normal", text="START SCAN")
         self.cancel_button.configure(state="disabled", text="CANCEL")
 
-        if self.OCR_IN_PLACE.get():
-            self._on_ocr_in_place_toggle()
-        else:
-            self.move_check.configure(state="normal")
-            self.ocr_in_place_check.configure(state="normal")
+        self._on_file_action_change()
 
     # =========================
     # OCR METHODS
@@ -644,17 +914,13 @@ class App(ctk.CTk):
         source_dir = self.source_entry.get()
         dest_dir = self.dest_entry.get()
         report_dir = self.report_entry.get()
-        move_files = self.MOVE_FILES.get()
+        move_files = self.FILE_ACTION.get() == "move"
         enable_report = self.ENABLE_REPORT.get()
         recursive = self.RECURSIVE_SCAN.get()
         dry_run = self.DRY_RUN.get()
-        ocr_in_place = self.OCR_IN_PLACE.get()
+        ocr_in_place = self.FILE_ACTION.get() == "ocr"
 
-        # Validate mutual exclusivity and check Tesseract
-        if move_files and ocr_in_place:
-            self.log("ERROR: Both 'Move files' and 'OCR in place' enabled. Select only one.")
-            self._scan_cleanup()
-            return
+        # Check Tesseract if OCR in place is selected
         if ocr_in_place:
             if not self._check_tesseract():
                 self._scan_cleanup()
@@ -719,7 +985,8 @@ class App(ctk.CTk):
         error_count = 0
         cancelled = False
         log_data_map = {}       # full_path -> file_log dict reference
-        self.tree_item_map = {} # reset for this scan
+        self.tree_item_map = {}    # reset for this scan
+        self.tree_iid_to_path = {} # reset reverse map
         ocr_success_count = 0
         ocr_fail_count = 0
 
@@ -819,6 +1086,7 @@ class App(ctk.CTk):
                     row_tag = "even" if scanned_count % 2 == 0 else "odd"
                     iid = self.tree.insert("", "end", values=(filename, ocr_status, char_display, action), tags=(row_tag,))
                     self.tree_item_map[full_path] = iid
+                    self.tree_iid_to_path[iid] = full_path
                 except Exception:
                     pass  # Window may have been destroyed
 
