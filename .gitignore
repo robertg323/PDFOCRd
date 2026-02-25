@@ -1,4 +1,6 @@
 build/
 dist/
 __pycache__/
-*.pyc
+*.pycpoppler/
+poppler.zip
+download_poppler.ps1

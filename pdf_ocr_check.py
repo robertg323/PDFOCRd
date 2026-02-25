@@ -17,9 +17,118 @@ from PIL import Image, ImageTk
 _PREVIEW_W = 360        # width of the preview panel (pixels)
 _PREVIEW_RENDER_W = 320 # target render width for PDF pages
 
-# Configure Tesseract path - must be set before any pytesseract calls
-os.environ['TESSDATA_PREFIX'] = r'C:\Program Files\Tesseract-OCR\tessdata'
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# =========================
+# TESSERACT PATH DISCOVERY
+# =========================
+
+def _find_tesseract_path():
+    """
+    Find Tesseract executable by checking common locations, then PATH.
+    Returns tuple: (tesseract_exe_path, tessdata_prefix_path) or (None, None) if not found.
+    """
+    # Common Windows installation locations
+    common_paths = [
+        r'C:\Program Files\Tesseract-OCR',
+        r'C:\Program Files (x86)\Tesseract-OCR',
+        os.path.expanduser(r'~\AppData\Local\Tesseract-OCR'),
+    ]
+    
+    # Check common locations
+    for base_path in common_paths:
+        tesseract_exe = os.path.join(base_path, 'tesseract.exe')
+        tessdata_dir = os.path.join(base_path, 'tessdata')
+        if os.path.exists(tesseract_exe):
+            return (tesseract_exe, tessdata_dir)
+    
+    # Fall back to checking PATH
+    try:
+        result = subprocess.run(['where', 'tesseract.exe'], 
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            tesseract_exe = result.stdout.strip().split('\n')[0]
+            base_path = os.path.dirname(tesseract_exe)
+            tessdata_dir = os.path.join(base_path, 'tessdata')
+            return (tesseract_exe, tessdata_dir)
+    except Exception:
+        pass
+    
+    return (None, None)
+
+# Get Tesseract paths and configure them
+_TESSERACT_EXE, _TESSDATA_PREFIX = _find_tesseract_path()
+
+if _TESSERACT_EXE and os.path.exists(_TESSERACT_EXE):
+    pytesseract.pytesseract.tesseract_cmd = _TESSERACT_EXE
+    if _TESSDATA_PREFIX and os.path.exists(_TESSDATA_PREFIX):
+        os.environ['TESSDATA_PREFIX'] = _TESSDATA_PREFIX
+
+# =========================
+# POPPLER PATH DISCOVERY
+# =========================
+
+def _find_poppler_path():
+    """
+    Find Poppler executables by checking bundled path, common locations, then PATH.
+    Returns the directory containing pdftoppm.exe, or None if not found.
+    """
+    candidate_paths = []
+    
+    # Check if running as a frozen PyInstaller exe (one-file or one-dir mode)
+    if getattr(sys, 'frozen', False):
+        # PyInstaller one-file mode: bundles are in sys._MEIPASS (temporary directory)
+        if hasattr(sys, '_MEIPASS'):
+            meipass_poppler = os.path.join(sys._MEIPASS, 'poppler')
+            candidate_paths.append(meipass_poppler)
+        
+        # PyInstaller one-dir mode: bundles are next to executable
+        exe_dir = os.path.dirname(sys.executable)
+        exe_poppler = os.path.join(exe_dir, 'poppler')
+        candidate_paths.append(exe_poppler)
+    
+    # Check relative to script directory (for development)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_poppler = os.path.join(script_dir, 'poppler')
+    candidate_paths.append(script_poppler)
+    
+    # Search all candidate directories
+    for poppler_root in candidate_paths:
+        if os.path.isdir(poppler_root):
+            # Check for nested poppler-<version> directories
+            try:
+                for item in os.listdir(poppler_root):
+                    if item.startswith('poppler-'):
+                        candidate = os.path.join(poppler_root, item, 'Library', 'bin')
+                        if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, 'pdftoppm.exe')):
+                            return candidate
+            except (OSError, PermissionError):
+                pass
+            
+            # Also check flat: poppler/Library/bin (if someone extracts it without nested dir)
+            flat_poppler = os.path.join(poppler_root, 'Library', 'bin')
+            if os.path.isdir(flat_poppler) and os.path.exists(os.path.join(flat_poppler, 'pdftoppm.exe')):
+                return flat_poppler
+    
+    # Check common Windows installation paths
+    common_paths = [
+        r'C:\Program Files\poppler\Library\bin',
+        r'C:\Program Files (x86)\poppler\Library\bin',
+        os.path.expanduser(r'~\AppData\Local\poppler\Library\bin'),
+    ]
+    for poppler_path in common_paths:
+        if os.path.isdir(poppler_path) and os.path.exists(os.path.join(poppler_path, 'pdftoppm.exe')):
+            return poppler_path
+    
+    # Fall back to checking PATH
+    try:
+        result = subprocess.run(['where', 'pdftoppm.exe'], 
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            pdftoppm_exe = result.stdout.strip().split('\n')[0]
+            return os.path.dirname(pdftoppm_exe)
+    except Exception:
+        pass
+    
+    return None
 
 # =========================
 # APPLICATION CLASS (GUI)
@@ -30,7 +139,7 @@ class App(ctk.CTk):
         super().__init__()
 
         # --- Configure Window ---
-        self.title("PDF OCR CHECK v1.0")
+        self.title("PDF OCR CHECK v1.01")
         self.geometry("950x850")
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -796,13 +905,16 @@ class App(ctk.CTk):
             self.log(f"DEBUG: TESSDATA_PREFIX={os.environ.get('TESSDATA_PREFIX')}")
             self.log(f"DEBUG: tesseract_cmd={pytesseract.pytesseract.tesseract_cmd}")
 
-            # Simply check if the executable exists (avoid subprocess issues in compiled exe)
-            tesseract_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-            if os.path.exists(tesseract_path):
-                self.log(f"Tesseract found at: {tesseract_path}")
+            # Check if the executable exists
+            if _TESSERACT_EXE and os.path.exists(_TESSERACT_EXE):
+                self.log(f"Tesseract found at: {_TESSERACT_EXE}")
                 return True
             else:
-                self.log("ERROR: Tesseract OCR engine not found at expected path.")
+                self.log("ERROR: Tesseract OCR engine not found.")
+                self.log("  Tried locations:")
+                self.log("    - C:\\Program Files\\Tesseract-OCR")
+                self.log("    - C:\\Program Files (x86)\\Tesseract-OCR")
+                self.log("    - System PATH")
                 self.log("  Install from: https://github.com/UB-Mannheim/tesseract/wiki")
                 self.log("  Then restart this application.")
                 return False
@@ -821,7 +933,15 @@ class App(ctk.CTk):
         """
         try:
             # Convert PDF pages to images
-            images = convert_from_path(pdf_path, dpi=300)
+            poppler_path = _find_poppler_path()
+            try:
+                self.log(f"DEBUG: poppler_path={poppler_path}")
+            except Exception:
+                pass
+            if poppler_path:
+                images = convert_from_path(pdf_path, dpi=300, poppler_path=poppler_path)
+            else:
+                images = convert_from_path(pdf_path, dpi=300)
             total_pages = len(images)
 
             # OCR each page and collect PDF bytes
